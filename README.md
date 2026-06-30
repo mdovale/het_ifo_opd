@@ -49,18 +49,17 @@ Key consequences exploited by the package:
   actuator distortion) are nuisances, not signal.
 * **Differential observable.** The two phasemeter channels share the laser, so
   their **difference** `φ = ch1 − ch2` rejects the common laser frequency noise
-  (~1700× in this data) and isolates the *residual* differential OPD — exactly
-  the "residual OPD" of interest. Per-channel absolute OPDs (~4–5 cm here) are
+  (~1700× in this data) and isolates the *residual* differential OPD, exactly
+  the quantity of interest. Per-channel absolute OPDs (~4–5 cm here) are
   retained as diagnostics.
 
 ## 2. Estimation method
 
 For each file the pipeline:
 
-1. **Selects the tone frequency.** Either a known value per file (recommended —
-   e.g. 100 Hz on Day06, 95 Hz on Day09) or auto-selects the strongest of
-   several candidate frequencies, then refines it on a fine periodogram grid
-   (robust to drive/digitizer clock offsets).
+1. **Uses the known modulation frequency** supplied by the user (per file or via
+   a filename map), optionally refining it on a fine periodogram grid to absorb
+   drive/digitizer clock offsets.
 2. **Estimates the amplitude with a least-squares lock-in** (primary). It fits
 
    ```
@@ -74,6 +73,8 @@ For each file the pipeline:
 3. **Cross-checks spectrally** with an independent LPSD single-bin estimate
    (`speckit`), where `A = √(2·PS)`. Agreement of the two methods is reported as
    a quality metric (≲0.1 % on the clean, high-SNR acquisitions).
+   The reported `tone_snr` is the coherent amplitude SNR `A/σ_A`, equal to
+   `amp_cycles / amp_unc_cycles`.
 4. **Quantifies uncertainty two ways:**
    * *Coherent (analytic):* `σ_A = √(S_n(f₀)/T)`, with the local background
      noise PSD `S_n` measured **on the lock-in residual** (the tone removed in
@@ -106,7 +107,7 @@ r = estimate_opd("FM1/FM1Day06_AnchoredAirOPD_EDUbase_R1_20260609_135823.zip",
                  mod_freq=100.0)
 print(f"OPD = {r.opd*1e3:.4f} mm  ± {r.opd_unc*1e6:.2f} µm (coherent)")
 print(f"            ± {r.opd_unc_empirical*1e6:.1f} µm (per-segment drift)")
-print(f"tone {r.tone_freq:.3f} Hz, SNR {r.tone_snr:.0f}, "
+print(f"tone {r.tone_freq:.3f} Hz, SNR {r.tone_snr:.3g}, "
       f"method agreement {r.method_agreement:.1e}")
 ```
 
@@ -127,9 +128,6 @@ print(ds.to_dataframe())
 ```bash
 # Mixed dataset, assigning the frequency by filename substring:
 python -m het_ifo_opd FM1/ --freq-map Day09=95 Day06=100 --out results --plots
-
-# Or auto-select among candidate frequencies (best when the tone is strong):
-python -m het_ifo_opd FM1/ --mod-freq-candidates 95 100 --out results
 ```
 
 ### Reproduce the FM1 analysis
@@ -142,44 +140,14 @@ writes `results/opd_results.csv`, a per-file 3-panel diagnostic plot (ASD with
 the tone marked · phase-folded synchronous-averaged tone · per-segment OPD
 stability), and a `summary.png` bar chart.
 
-## 5. FM1 results (residual differential OPD)
-
-Day06 was modulated at **100 Hz**, Day09 at **95 Hz** (`δν_pk = 188 MHz` for
-both). The *anchored* configurations are cleanly measured (tone SNR 10⁵–10⁶,
-sub-µm coherent uncertainty); *unanchored* / *released* configurations show much
-larger per-segment scatter, reflecting genuine mechanical OPD drift, which the
-diagnostics flag via SNR, method-agreement, and empirical uncertainty.
-
-| Acquisition | f_mod | OPD [mm] | σ coherent [µm] | σ drift [µm] | tone SNR |
-|---|---|---|---|---|---|
-| Day06 Anchored Air R1 | 100 | 1.072 | 0.30 | 6.4 | 5.0e5 |
-| Day06 Anchored Air R2 | 100 | 0.706 | 0.43 | 30 | 1.9e5 |
-| Day06 Anchored Vacuum R1 | 100 | 1.182 | 0.92 | 2.4 | 2.8e5 |
-| Day06 Anchored Vacuum R2 | 100 | 1.191 | 0.70 | 4.9 | 2.7e5 |
-| Day06 Unanchored Air R1 | 100 | 0.146 | 0.73 | 37 | 147 |
-| Day06 Unanchored Air R2 | 100 | 0.544 | 8.0 | 70 | 211 |
-| Day06 Unanchored Vacuum R1 | 100 | 0.419 | 3.9 | 110 | 2.0 |
-| Day06 Unanchored Vacuum R2 | 100 | 1.405 | 7.8 | 369 | 9.5 |
-| Day09 Air Released NoShims Torqued R1 | 95 | 0.150 | 1.8 | 188 | 10 |
-| Day09 Air Released NoShims Torqued R2 | 95 | 0.405 | 6.8 | 835 | 5.9 |
-| Day09 Air Released NoShims R1 | 95 | 0.267 | 0.89 | 43 | 19 |
-| Day09 Air Released NoShims R2 | 95 | 0.453 | 8.7 | 82 | 137 |
-| Day09 Air Released Shimmed Torqued R1 | 95 | 0.497 | 2.1 | 259 | 5.6 |
-| Day09 Air Released Shimmed Torqued R2 | 95 | 0.857 | 13 | 150 | 30 |
-| Day09 Vacuum Released Shimmed Torqued R1 | 95 | 0.164 | 1.3 | 104 | 2.2 |
-| Day09 Vacuum Released Shimmed Torqued R2 | 95 | 0.279 | 8.6 | 58 | 26 |
-
-Full numbers (and `amp_cyc`, `method_agreement`, `harmonic_ratio`, …) are in
-`results/opd_results.csv`.
-
-## 6. Package layout
+## 5. Package layout
 
 ```
 het_ifo_opd/
   config.py       OPDConfig: physics + analysis parameters (FM1 defaults)
   physics.py      phase-amplitude  <->  OPD conversions
   io.py           load Moku:Pro Phasemeter files -> differential phase
-  estimators.py   tone detection, least-squares lock-in, spectral single-bin,
+  estimators.py   frequency refinement, least-squares lock-in, spectral single-bin,
                   local noise PSD, per-segment amplitudes
   pipeline.py     estimate_opd / estimate_opd_dataset -> OPDResult / DatasetResult
   plotting.py     per-file diagnostics and dataset summary
@@ -188,7 +156,7 @@ scripts/analyze_fm1.py   authoritative FM1 run
 tests/test_validation.py synthetic accuracy & uncertainty-calibration tests
 ```
 
-## 7. Validation
+## 6. Validation
 
 `python tests/test_validation.py` (or `pytest -q`) verifies on synthetic data
 that the estimator recovers an injected OPD to <1 % on realistic low-frequency-
