@@ -20,7 +20,8 @@ def plot_diagnostics(
 ):
     """Three-panel diagnostic figure for one acquisition.
 
-    (1) ASD of the differential phase with the modulation tone marked.
+    (1) Welch ASD of the differential phase (linear frequency axis) with the
+        modulation tone marked.
     (2) A few cycles of the differential phase with the lock-in fit overlaid.
     (3) Per-segment OPD stability with the mean and 1-sigma band.
 
@@ -28,7 +29,7 @@ def plot_diagnostics(
     ``result.path``.
     """
     import matplotlib.pyplot as plt
-    from speckit import compute_spectrum
+    from scipy.signal import welch
 
     if config is None:
         config = OPDConfig()
@@ -43,13 +44,17 @@ def plot_diagnostics(
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.2))
 
-    # (1) ASD
-    spec = compute_spectrum(phi - np.mean(phi), fs, win=config.window, olap="default")
+    # (1) ASD via scipy.welch (linear frequency axis, log ASD).
+    x = (phi - np.mean(phi)) * (2 * np.pi)  # cycles -> radians
+    nperseg = min(int(60.0 * fs), x.size)
+    noverlap = nperseg // 2
+    f, psd = welch(x, fs=fs, nperseg=nperseg, noverlap=noverlap, detrend="constant")
+    asd = np.sqrt(psd)
     ax = axes[0]
-    ax.loglog(spec.f, spec.asd, lw=0.8)
+    ax.semilogy(f, asd, lw=0.8)
     ax.axvline(f0, color="C3", ls="--", lw=1, label=f"{f0:.3f} Hz")
     ax.set_xlabel("Frequency [Hz]")
-    ax.set_ylabel(r"ASD [cyc/$\sqrt{\mathrm{Hz}}$]")
+    ax.set_ylabel(r"ASD [rad/$\sqrt{\mathrm{Hz}}$]")
     ax.set_title(f"{result.name}\nDifferential phase ({label})", fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8)
@@ -90,7 +95,7 @@ def plot_diagnostics(
     ax.set_xlabel(f"Phase of {f0:.3f} Hz tone [cycles]")
     ax.set_ylabel("Phase [mcyc]")
     ax.set_title(f"Folded tone: A = {result.amp_cycles:.3e} cyc "
-                 f"(SNR {result.tone_snr:.0f})", fontsize=9)
+                 f"(SNR {result.tone_snr:.3g})", fontsize=9)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
 
