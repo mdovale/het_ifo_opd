@@ -36,14 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--wavelength", type=float, default=1550e-9, help="Laser wavelength [m].")
     g.add_argument("--actuator-tf", type=float, default=376e6, help="Actuator TF [Hz/V].")
     g.add_argument("--mod-vpp", type=float, default=1.0, help="Modulation amplitude [Vpp].")
-    g.add_argument("--mod-freq", type=float, default=100.0, help="Modulation frequency [Hz].")
-    g.add_argument("--mod-freq-candidates", type=float, nargs="+", default=None,
-                   help="Candidate modulation frequencies [Hz]; the strongest tone "
-                   "is auto-selected per file (e.g. 95 100).")
+    g.add_argument("--mod-freq", type=float, default=100.0,
+                   help="Modulation frequency [Hz] (default for all files).")
     g.add_argument("--freq-map", nargs="+", default=None, metavar="SUBSTR=FREQ",
-                   help="Assign the known modulation frequency by filename "
-                   "substring, e.g. 'Day09=95 Day06=100'. Takes precedence over "
-                   "candidates/auto-detection for matching files.")
+                   help="Assign the modulation frequency by filename "
+                   "substring, e.g. 'Day09=95 Day06=100'. Overrides --mod-freq "
+                   "for matching files.")
 
     g = p.add_argument_group("analysis")
     g.add_argument("--channels", type=int, nargs=2, default=None,
@@ -72,7 +70,6 @@ def main(argv: List[str] | None = None) -> int:
         actuator_tf=args.actuator_tf,
         mod_vpp=args.mod_vpp,
         mod_freq=args.mod_freq,
-        mod_freq_candidates=args.mod_freq_candidates,
         channels=tuple(args.channels) if args.channels else None,
         refine_frequency=not args.no_refine,
         n_harmonics=args.harmonics,

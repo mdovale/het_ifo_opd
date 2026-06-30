@@ -25,14 +25,17 @@ from het_ifo_opd import OPDConfig, estimate_opd_dataset
 from het_ifo_opd.plotting import plot_dataset_summary, plot_diagnostics
 
 
-def fm1_freq_resolver(path: str):
+def fm1_freq_resolver(path: str) -> float:
     """Modulation frequency [Hz] by acquisition day for the FM1 set."""
     base = os.path.basename(path)
     if "Day09" in base:
         return 95.0
     if "Day06" in base:
         return 100.0
-    return None  # fall back to config candidates/auto-detection
+    raise ValueError(
+        f"Cannot determine modulation frequency for {base!r}; "
+        "expected Day06 or Day09 in the filename"
+    )
 
 
 def main(argv=None):

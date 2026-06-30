@@ -20,7 +20,7 @@ which equals the Cramer-Rao bound ``sigma * sqrt(2/N)`` for white noise.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -67,49 +67,6 @@ def refine_frequency(
     grid = np.linspace(f0 - halfwidth, f0 + halfwidth, n_grid)
     powers = np.array([_projection_power(x, n, fs, f) for f in grid])
     return float(grid[int(np.argmax(powers))])
-
-
-def detect_tone_frequency(
-    phi: np.ndarray,
-    fs: float,
-    candidates: Sequence[float],
-    halfwidth: float = 0.5,
-    n_grid: int = 2001,
-) -> Tuple[float, float, float]:
-    """Select the modulation tone among several candidate frequencies.
-
-    For each candidate nominal frequency the periodogram is maximised within a
-    ``+/- halfwidth`` window; the candidate whose refined peak carries the most
-    coherent power is returned.  This lets one configuration cover acquisitions
-    taken with different modulation frequencies (e.g. 95 Hz vs 100 Hz).
-
-    Returns
-    -------
-    f0 : float
-        Refined frequency [Hz] of the strongest candidate tone.
-    snr : float
-        Ratio of the winning peak power to the median periodogram power across
-        all candidate windows -- a robust significance indicator.
-    nominal : float
-        The candidate (nominal) frequency that was selected.
-    """
-    n = np.arange(phi.size)
-    x = phi - np.mean(phi)
-
-    best = None  # (power, f0, nominal)
-    all_powers = []
-    for fc in candidates:
-        grid = np.linspace(fc - halfwidth, fc + halfwidth, n_grid)
-        powers = np.array([_projection_power(x, n, fs, f) for f in grid])
-        all_powers.append(powers)
-        i = int(np.argmax(powers))
-        cand = (powers[i], float(grid[i]), float(fc))
-        if best is None or cand[0] > best[0]:
-            best = cand
-
-    med = float(np.median(np.concatenate(all_powers)))
-    snr = best[0] / med if med > 0 else np.inf
-    return best[1], float(snr), best[2]
 
 
 def _design_matrix(t, f0, n_harmonics, detrend_order):

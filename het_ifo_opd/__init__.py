@@ -11,7 +11,7 @@ uncertainty.
 Quick start
 -----------
 >>> from het_ifo_opd import estimate_opd
->>> r = estimate_opd("FM1/some_acquisition.zip")
+>>> r = estimate_opd("FM1/some_acquisition.zip", mod_freq=100.0)
 >>> print(r.opd * 1e3, "mm +/-", r.opd_unc * 1e6, "um")
 """
 from __future__ import annotations
@@ -26,7 +26,6 @@ from .physics import (
 )
 from .estimators import (
     LockinResult,
-    detect_tone_frequency,
     lockin_amplitude,
     local_noise_psd,
     refine_frequency,
@@ -56,7 +55,6 @@ __all__ = [
     "lockin_amplitude",
     "single_bin_amplitude",
     "refine_frequency",
-    "detect_tone_frequency",
     "local_noise_psd",
     "segmented_amplitudes",
     "OPDResult",

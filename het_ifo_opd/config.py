@@ -8,7 +8,7 @@ data set described in the task statement.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 # Speed of light in vacuum [m/s] (exact, SI).
 C_LIGHT = 299_792_458.0
@@ -31,13 +31,7 @@ class OPDConfig:
         Peak-to-peak modulation voltage [V] applied to the actuator.
     mod_freq : float
         Nominal modulation frequency [Hz] (the tone whose amplitude encodes the
-        OPD).  Used as the sole candidate when ``mod_freq_candidates`` is None.
-    mod_freq_candidates : sequence of float | None
-        Optional list of *candidate* nominal modulation frequencies.  When set,
-        the pipeline auto-selects the candidate carrying the strongest coherent
-        tone (e.g. ``(95.0, 100.0)`` to handle acquisitions taken with either
-        modulation).  This makes a single configuration valid across a mixed
-        data set without manual per-file tuning.
+        OPD).  Must match the drive frequency for the acquisition under study.
 
     Analysis
     --------
@@ -78,7 +72,6 @@ class OPDConfig:
     actuator_tf: float = 376e6
     mod_vpp: float = 1.0
     mod_freq: float = 100.0
-    mod_freq_candidates: Optional[Sequence[float]] = None
 
     # --- Analysis: channel selection ---
     channels: Optional[Tuple[int, int]] = None
@@ -114,9 +107,3 @@ class OPDConfig:
         """Nominal optical carrier frequency [Hz] = c / wavelength."""
         return C_LIGHT / self.laser_wavelength
 
-    @property
-    def candidate_freqs(self) -> Tuple[float, ...]:
-        """Tuple of candidate nominal modulation frequencies [Hz]."""
-        if self.mod_freq_candidates:
-            return tuple(float(f) for f in self.mod_freq_candidates)
-        return (float(self.mod_freq),)

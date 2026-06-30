@@ -19,13 +19,29 @@ import pandas as pd
 from .config import OPDConfig
 from .estimators import (
     LockinResult,
-    detect_tone_frequency,
     lockin_amplitude,
+    refine_frequency,
     segmented_amplitudes,
     single_bin_amplitude,
 )
 from .io import PhasemeterData, load_phasemeter
 from .physics import opd_to_delay, phase_cycles_to_opd
+
+
+def _resolve_mod_freq(
+    mod_freq: Optional[float],
+    config: OPDConfig,
+    path: Optional[str] = None,
+    freq_resolver: Optional[Callable[[str], Optional[float]]] = None,
+) -> float:
+    """Return the user-supplied modulation frequency [Hz] for one acquisition."""
+    if mod_freq is not None:
+        return float(mod_freq)
+    if path is not None and freq_resolver is not None:
+        resolved = freq_resolver(path)
+        if resolved is not None:
+            return float(resolved)
+    return float(config.mod_freq)
 
 
 @dataclass
@@ -43,8 +59,8 @@ class OPDResult:
     # Underlying tone amplitude estimate.
     observable: str                  # e.g. "ch1-ch2"
     tone_freq: float                 # [Hz] refined modulation tone frequency
-    tone_freq_nominal: float         # [Hz] selected nominal (candidate) frequency
-    tone_snr: float                  # peak-power / median-power significance
+    tone_freq_nominal: float         # [Hz] user-supplied modulation frequency
+    tone_snr: float                  # coherent amplitude SNR: A / sigma_A
     amp_cycles: float                # fundamental amplitude [cycles]
     amp_unc_cycles: float            # [cycles] coherent uncertainty
 
@@ -100,10 +116,9 @@ def estimate_opd(
         Physics/analysis configuration (defaults match the FM1 set-up).
     logger : logging.Logger, optional
     mod_freq : float, optional
-        Known modulation frequency [Hz] for *this* acquisition.  When given it
-        overrides ``config.mod_freq``/``mod_freq_candidates`` (recommended when
-        the drive frequency is known, since candidate auto-selection is
-        unreliable for weak tones).
+        Known modulation frequency [Hz] for *this* acquisition.  When omitted,
+        ``config.mod_freq`` is used, or ``freq_resolver`` when estimating a
+        dataset.
     """
     if config is None:
         config = OPDConfig()
@@ -123,13 +138,13 @@ def estimate_opd(
     label, phi = data.differential(config.channels)
     fs = data.fs
 
-    # 1) Tone frequency: pick the strongest candidate; the detector also returns
-    #    the sub-bin-refined peak frequency within that candidate's window.
-    candidates = (float(mod_freq),) if mod_freq is not None else config.candidate_freqs
-    f_detected, snr, f_nominal = detect_tone_frequency(
-        phi, fs, candidates, halfwidth=config.freq_search_halfwidth
-    )
-    f0 = f_detected if config.refine_frequency else f_nominal
+    f_nominal = _resolve_mod_freq(mod_freq, config)
+    if config.refine_frequency:
+        f0 = refine_frequency(
+            phi, fs, f_nominal, halfwidth=config.freq_search_halfwidth
+        )
+    else:
+        f0 = f_nominal
 
     # 2) Primary estimator: least-squares lock-in.
     lk: LockinResult = lockin_amplitude(
@@ -177,6 +192,12 @@ def estimate_opd(
         amp_ch = single_bin_amplitude(phi_ch, fs, f0, window=config.window)
         channel_opds[f"ch{ch}"] = float(phase_cycles_to_opd(amp_ch, dnu_pk))
 
+    tone_snr = (
+        float(lk.amplitude / lk.amp_unc_coherent)
+        if lk.amp_unc_coherent > 0
+        else float("inf")
+    )
+
     return OPDResult(
         name=data.name,
         path=data.path,
@@ -186,7 +207,7 @@ def estimate_opd(
         observable=label,
         tone_freq=f0,
         tone_freq_nominal=f_nominal,
-        tone_snr=float(snr),
+        tone_snr=tone_snr,
         amp_cycles=lk.amplitude,
         amp_unc_cycles=lk.amp_unc_coherent,
         amp_cycles_spectral=amp_spec,
@@ -217,7 +238,7 @@ def estimate_opd_dataset(
     freq_resolver : callable, optional
         ``path -> mod_freq`` (or ``None``).  Use it to assign the known
         modulation frequency per file (e.g. 95 Hz vs 100 Hz by acquisition day).
-        When it returns ``None`` the configured candidates/auto-detection apply.
+        When it returns ``None``, ``config.mod_freq`` is used.
     """
     if logger is None:
         logger = logging.getLogger(__name__)
@@ -229,7 +250,7 @@ def estimate_opd_dataset(
     results: List[OPDResult] = []
     for p in file_list:
         logger.info("Processing %s", os.path.basename(p))
-        mf = freq_resolver(p) if freq_resolver is not None else None
+        mf = _resolve_mod_freq(None, config, path=p, freq_resolver=freq_resolver)
         results.append(estimate_opd(p, config=config, logger=logger, mod_freq=mf))
 
     return DatasetResult(results=results, config=config or OPDConfig())
