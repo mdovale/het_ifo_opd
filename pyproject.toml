@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "het-ifo-opd"
+version = "0.1.0"
+description = "Optimal estimation of interferometer residual OPD from frequency-modulated Moku:Pro Phasemeter data."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "HET IFO OPD analysis" }]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "pandas>=1.5",
+    "matplotlib>=3.6",
+    "speckit",
+    "mokutools>=1.0.3",
+]
+
+[project.scripts]
+het-ifo-opd = "het_ifo_opd.cli:main"
+
+[tool.setuptools]
+packages = ["het_ifo_opd"]
