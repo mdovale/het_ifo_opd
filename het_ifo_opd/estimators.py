@@ -12,6 +12,15 @@ modulation frequency are provided:
 * :func:`single_bin_amplitude` -- an LPSD single-bin spectral estimate via
   speckit, used as an independent cross-check.
 
+* :func:`demodulate` -- a complex-baseband (heterodyne + low-pass) demodulator
+  that is the *primary* OPD estimator.  It shifts the tone to DC and low-passes
+  to a narrow band, which makes it immune to spectral leakage from the very
+  large low-frequency differential-phase wander (the ``nu0 * OPD(t) / c`` term,
+  tens of cycles RMS) that would otherwise bias a rectangular-window lock-in
+  through its ``1/f`` sidelobes.  It returns the instantaneous tone phasor
+  ``z(t)`` -- hence the instantaneous OPD ``|z(t)|`` and the true tone phase --
+  and chooses coherent vs incoherent integration from a measured coherence.
+
 The analytic (coherent-integration) uncertainty is computed from the local
 background noise PSD: for integration time ``T`` and one-sided noise PSD
 ``S_n(f0)`` the amplitude standard deviation is ``sigma_A = sqrt(S_n / T)``,
@@ -23,6 +32,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from scipy.signal import fftconvolve, firwin
 
 from speckit import compute_single_bin, compute_spectrum
 
@@ -220,3 +230,161 @@ def segmented_amplitudes(
         coef, *_ = np.linalg.lstsq(A, seg, rcond=None)
         amps.append(np.hypot(coef[0], coef[1]))
     return np.asarray(amps)
+
+
+@dataclass
+class DemodResult:
+    """Complex-baseband demodulation of the modulation tone.
+
+    All amplitudes are zero-to-peak, in cycles, so that ``|z|`` is directly the
+    phase-tone amplitude (and hence maps to an OPD via
+    :func:`het_ifo_opd.physics.phase_cycles_to_opd`).
+    """
+
+    f0: float                    # heterodyne (tone) frequency [Hz]
+    bandwidth: float             # one-sided low-pass bandwidth [Hz]
+    t: np.ndarray                # baseband time vector [s]
+    z: np.ndarray                # complex baseband phasor, |z| = amplitude [cyc]
+    fs_bb: float                 # baseband sample rate [Hz]
+    amp_inst: np.ndarray         # |z(t)| instantaneous amplitude [cyc]
+    phase_inst: np.ndarray       # unwrapped arg z(t) [rad]
+    noise_ms: float              # off-tone mean-square E|noise|^2 in baseband [cyc^2]
+    n_eff: float                 # effective independent looks (T * 2 * bandwidth)
+    amp_coherent: float          # coherent amplitude, const-offset removed [cyc]
+    amp_incoherent: float        # noise-debiased incoherent amplitude [cyc]
+    amp_unc: float               # coherent noise-floor uncertainty on amplitude [cyc]
+    coherence: float             # amp_coherent / amp_incoherent, in [0, ~1]
+    freq_offset: float           # fitted constant tone frequency offset from f0 [Hz]
+    mode: str                    # "coherent" | "incoherent"
+    amplitude: float             # headline (mode-selected) amplitude [cyc]
+    numtaps: int                 # FIR length used
+
+
+def _heterodyne_lowpass(phi, fs, f0, bandwidth, fs_bb_target):
+    """Shift ``f0`` to DC, low-pass to ``+/-bandwidth``, and decimate.
+
+    Returns ``(t_bb, z_bb, fs_bb, numtaps)`` where ``|z_bb|`` is the zero-to-peak
+    tone amplitude (the factor of two undoes the ``A/2`` of real-signal
+    down-conversion).  A linear-phase FIR is applied with :func:`fftconvolve`
+    (``mode="same"``, so no net group delay) and the filter-transient edges are
+    trimmed after decimation.
+    """
+    phi = np.asarray(phi, dtype=float)
+    n = phi.size
+    t = np.arange(n) / fs
+    z = (phi - phi.mean()) * np.exp(-2j * np.pi * f0 * t)
+
+    # FIR low-pass at the one-sided bandwidth; Kaiser for a deep, controlled
+    # stopband so the huge out-of-band low-frequency wander cannot leak in.
+    numtaps = int(round(6.0 * fs / bandwidth)) | 1
+    numtaps = min(numtaps, (n // 2) * 2 - 1)
+    fir = firwin(numtaps, bandwidth, fs=fs, window=("kaiser", 8.6))
+    zf = 2.0 * fftconvolve(z, fir, mode="same")
+
+    d = max(1, int(round(fs / fs_bb_target)))
+    zf = zf[::d]
+    t_bb = t[::d]
+    fs_bb = fs / d
+    edge = max(1, int(round((numtaps // 2) / d)))
+    if zf.size > 2 * edge + 2:
+        zf = zf[edge:-edge]
+        t_bb = t_bb[edge:-edge]
+    return t_bb, zf, fs_bb, numtaps
+
+
+def demodulate(
+    phi: np.ndarray,
+    fs: float,
+    f0: float,
+    bandwidth: float = 0.5,
+    fs_bb_target: Optional[float] = None,
+    off_tone: float = 7.0,
+    coherence_threshold: float = 0.7,
+) -> DemodResult:
+    """Complex-baseband demodulation of the tone at ``f0`` (primary estimator).
+
+    Parameters
+    ----------
+    phi : np.ndarray
+        Differential phase [cycles].
+    fs : float
+        Sampling frequency [Hz].
+    f0 : float
+        Tone frequency [Hz] (already refined, if desired).
+    bandwidth : float
+        One-sided low-pass bandwidth [Hz] retained around the tone.  It must be
+        wide enough to pass any real amplitude/phase dynamics of the tone but
+        narrow enough to reject the broadband differential-phase noise.
+    fs_bb_target : float, optional
+        Target baseband sample rate [Hz].  Defaults to ``8 * bandwidth``.
+    off_tone : float
+        Offset [Hz] of the noise-reference demodulation (``f0 +/- off_tone``),
+        placed away from the tone and its harmonics, used to measure the
+        in-band noise power for the incoherent debiasing and the uncertainty.
+    coherence_threshold : float
+        If the coherent/incoherent amplitude ratio is at least this value the
+        tone is treated as phase-coherent and coherent integration is reported;
+        otherwise the noise-debiased incoherent amplitude is reported.
+
+    Returns
+    -------
+    DemodResult
+    """
+    if fs_bb_target is None:
+        fs_bb_target = 8.0 * bandwidth
+
+    t_bb, z, fs_bb, numtaps = _heterodyne_lowpass(
+        phi, fs, f0, bandwidth, fs_bb_target
+    )
+
+    # Off-tone noise reference with the *same* filter.  Keep it below Nyquist and
+    # flip to f0 - off_tone if f0 + off_tone would run past the usable band.
+    nyq = fs / 2.0
+    f_off = f0 + off_tone
+    if f_off > 0.9 * nyq or f_off <= 0:
+        f_off = f0 - off_tone
+    _, z_off, _, _ = _heterodyne_lowpass(phi, fs, f_off, bandwidth, fs_bb_target)
+    noise_ms = float(np.mean(np.abs(z_off) ** 2))
+
+    amp_inst = np.abs(z)
+    mean_sq = float(np.mean(amp_inst ** 2))
+    amp_incoherent = float(np.sqrt(max(mean_sq - noise_ms, 0.0)))
+
+    # Coherent amplitude allowing a constant tone frequency offset (a residual
+    # linear phase ramp left by frequency refinement): de-rotate then average.
+    phase_inst = np.unwrap(np.angle(z))
+    slope, _ = np.polyfit(t_bb, phase_inst, 1)
+    freq_offset = float(slope / (2.0 * np.pi))
+    z_derot = z * np.exp(-1j * (slope * t_bb))
+    amp_coherent = float(np.abs(np.mean(z_derot)))
+
+    coherence = amp_coherent / amp_incoherent if amp_incoherent > 0 else 0.0
+
+    duration = float(t_bb[-1] - t_bb[0]) if t_bb.size > 1 else 0.0
+    n_eff = max(duration * 2.0 * bandwidth, 1.0)
+    amp_unc = float(np.sqrt(noise_ms / n_eff))
+
+    if coherence >= coherence_threshold:
+        mode, amplitude = "coherent", amp_coherent
+    else:
+        mode, amplitude = "incoherent", amp_incoherent
+
+    return DemodResult(
+        f0=float(f0),
+        bandwidth=float(bandwidth),
+        t=t_bb,
+        z=z,
+        fs_bb=float(fs_bb),
+        amp_inst=amp_inst,
+        phase_inst=phase_inst,
+        noise_ms=noise_ms,
+        n_eff=float(n_eff),
+        amp_coherent=amp_coherent,
+        amp_incoherent=amp_incoherent,
+        amp_unc=amp_unc,
+        coherence=float(coherence),
+        freq_offset=freq_offset,
+        mode=mode,
+        amplitude=float(amplitude),
+        numtaps=int(numtaps),
+    )

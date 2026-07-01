@@ -59,6 +59,21 @@ class OPDConfig:
         Half-width [Hz] of the band around the tone, evaluated on the lock-in
         residual, used to estimate the local background noise PSD for the
         analytic (coherent) uncertainty.
+    demod_bandwidth : float
+        One-sided low-pass bandwidth [Hz] of the complex-baseband demodulator
+        (the primary estimator).  Wide enough to pass real tone dynamics, narrow
+        enough to reject broadband differential-phase noise and, crucially, to
+        prevent spectral leakage from the large low-frequency phase wander.
+    demod_fs_bb : float | None
+        Target baseband sample rate [Hz] after demodulation/decimation.
+        ``None`` uses ``8 * demod_bandwidth``.
+    demod_off_tone : float
+        Offset [Hz] of the off-tone noise reference used by the demodulator to
+        measure the in-band noise (for debiasing and uncertainty).
+    coherence_threshold : float
+        Coherent/incoherent amplitude ratio at/above which the tone is treated
+        as phase-coherent (coherent integration); below it the demodulator
+        reports the noise-debiased incoherent amplitude.
     window : str
         speckit window used for the single-bin spectral cross-check.
     start_time : float | None
@@ -85,6 +100,12 @@ class OPDConfig:
     # --- Analysis: uncertainty ---
     n_stability_segments: int = 10
     noise_band_halfwidth: float = 10.0
+
+    # --- Analysis: complex-baseband demodulator (primary estimator) ---
+    demod_bandwidth: float = 0.5
+    demod_fs_bb: Optional[float] = None
+    demod_off_tone: float = 7.0
+    coherence_threshold: float = 0.7
 
     # --- Analysis: spectral cross-check ---
     window: str = "kaiser"

@@ -25,7 +25,9 @@ from .physics import (
     phase_cycles_to_opd,
 )
 from .estimators import (
+    DemodResult,
     LockinResult,
+    demodulate,
     lockin_amplitude,
     local_noise_psd,
     refine_frequency,
@@ -52,7 +54,9 @@ __all__ = [
     "opd_to_delay",
     "opd_to_carrier_cycles",
     "LockinResult",
+    "DemodResult",
     "lockin_amplitude",
+    "demodulate",
     "single_bin_amplitude",
     "refine_frequency",
     "local_noise_psd",
