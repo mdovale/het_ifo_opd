@@ -50,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--harmonics", type=int, default=3, help="Number of fitted harmonics.")
     g.add_argument("--detrend-order", type=int, default=3, help="Polynomial detrend order.")
     g.add_argument("--segments", type=int, default=10, help="Stability segments.")
+    g.add_argument("--demod-bandwidth", type=float, default=0.5,
+                   help="One-sided baseband bandwidth [Hz] of the demodulator.")
+    g.add_argument("--demod-off-tone", type=float, default=7.0,
+                   help="Off-tone offset [Hz] for the demodulator noise reference.")
+    g.add_argument("--coherence-threshold", type=float, default=0.7,
+                   help="Coherence at/above which coherent integration is used.")
     g.add_argument("--start-time", type=float, default=None, help="Analysis start [s].")
     g.add_argument("--duration", type=float, default=None, help="Analysis duration [s].")
 
@@ -75,6 +81,9 @@ def main(argv: List[str] | None = None) -> int:
         n_harmonics=args.harmonics,
         detrend_order=args.detrend_order,
         n_stability_segments=args.segments,
+        demod_bandwidth=args.demod_bandwidth,
+        demod_off_tone=args.demod_off_tone,
+        coherence_threshold=args.coherence_threshold,
         start_time=args.start_time,
         duration=args.duration,
     )

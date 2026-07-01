@@ -18,7 +18,9 @@ import pandas as pd
 
 from .config import OPDConfig
 from .estimators import (
+    DemodResult,
     LockinResult,
+    demodulate,
     lockin_amplitude,
     refine_frequency,
     segmented_amplitudes,
@@ -46,33 +48,55 @@ def _resolve_mod_freq(
 
 @dataclass
 class OPDResult:
-    """Outcome of an OPD estimation for a single acquisition."""
+    """Outcome of an OPD estimation for a single acquisition.
+
+    The headline OPD comes from the complex-baseband demodulator
+    (:func:`het_ifo_opd.estimators.demodulate`), which is leakage-immune and
+    yields the instantaneous OPD time series ``opd_t(t_bb)``.  For acquisitions
+    whose OPD genuinely evolves (e.g. released/torqued configurations) the time
+    series is the real deliverable and ``opd`` / ``opd_drift`` summarise it as
+    ``mean +/- drift``.  The rectangular-window lock-in and the spectral
+    single-bin estimate are retained as cross-checks / leakage diagnostics.
+    """
 
     name: str
     path: str
 
     # Headline result (differential / residual OPD).
-    opd: float                       # [m]
-    opd_unc: float                   # [m] 1-sigma (coherent)
+    opd: float                       # [m] mode-selected tone amplitude -> OPD
+    opd_unc: float                   # [m] 1-sigma coherent noise-floor
+    opd_drift: float                 # [m] 1-sigma of OPD(t) (physical variation)
     opd_unc_empirical: float         # [m] 1-sigma (per-segment scatter of mean)
 
     # Underlying tone amplitude estimate.
     observable: str                  # e.g. "ch1-ch2"
     tone_freq: float                 # [Hz] refined modulation tone frequency
     tone_freq_nominal: float         # [Hz] user-supplied modulation frequency
+    tone_freq_offset: float          # [Hz] residual tone offset from tone_freq
     tone_snr: float                  # coherent amplitude SNR: A / sigma_A
-    amp_cycles: float                # fundamental amplitude [cycles]
-    amp_unc_cycles: float            # [cycles] coherent uncertainty
+    amp_cycles: float                # headline tone amplitude [cycles]
+    amp_unc_cycles: float            # [cycles] coherent noise-floor uncertainty
+
+    # Demodulator integration diagnostics.
+    integration_mode: str            # "coherent" | "incoherent"
+    coherence: float                 # coherent/incoherent amplitude ratio
+    demod_bandwidth: float           # [Hz] one-sided baseband bandwidth
 
     # Cross-check & quality diagnostics.
+    amp_cycles_lockin: float         # rectangular-window lock-in amplitude [cyc]
     amp_cycles_spectral: float       # speckit single-bin amplitude [cycles]
-    method_agreement: float          # |lockin-spectral|/lockin (relative)
+    method_agreement: float          # |demod-spectral|/demod (relative)
+    leakage_ratio: float             # lock-in / demod amplitude (>1 => leakage)
     delay: float                     # equivalent differential delay [s]
     residual_std: float              # lock-in residual std [cycles]
     noise_psd: float                 # local noise PSD at f0 [cyc^2/Hz]
     harmonic_ratio: float            # 2nd-harmonic / fundamental amplitude
     duration: float                  # [s]
     fs: float                        # [Hz]
+
+    # Instantaneous OPD time series (baseband) -- the deliverable.
+    t_bb: np.ndarray = field(default_factory=lambda: np.array([]))
+    opd_t: np.ndarray = field(default_factory=lambda: np.array([]))
 
     # Stationarity diagnostics.
     segment_opds: np.ndarray = field(default_factory=lambda: np.array([]))
@@ -87,9 +111,13 @@ class OPDResult:
             "observable": self.observable,
             "OPD_mm": self.opd * 1e3,
             "OPD_unc_um": self.opd_unc * 1e6,
-            "OPD_unc_emp_um": self.opd_unc_empirical * 1e6,
+            "OPD_drift_um": self.opd_drift * 1e6,
+            "mode": self.integration_mode,
+            "coherence": self.coherence,
+            "leakage_ratio": self.leakage_ratio,
             "f_nom_Hz": self.tone_freq_nominal,
             "tone_freq_Hz": self.tone_freq,
+            "tone_df_mHz": self.tone_freq_offset * 1e3,
             "tone_snr": self.tone_snr,
             "amp_cyc": self.amp_cycles,
             "amp_spec_cyc": self.amp_cycles_spectral,
@@ -146,7 +174,23 @@ def estimate_opd(
     else:
         f0 = f_nominal
 
-    # 2) Primary estimator: least-squares lock-in.
+    dnu_pk = config.freq_dev_peak
+
+    # 2) Primary estimator: complex-baseband demodulation (leakage-immune).
+    dm: DemodResult = demodulate(
+        phi, fs, f0,
+        bandwidth=config.demod_bandwidth,
+        fs_bb_target=config.demod_fs_bb,
+        off_tone=config.demod_off_tone,
+        coherence_threshold=config.coherence_threshold,
+    )
+    opd_t = phase_cycles_to_opd(dm.amp_inst, dnu_pk)
+    opd = float(phase_cycles_to_opd(dm.amplitude, dnu_pk))
+    opd_unc = float(phase_cycles_to_opd(dm.amp_unc, dnu_pk))
+    opd_drift = float(np.std(opd_t)) if opd_t.size > 1 else float("nan")
+
+    # 3) Rectangular-window lock-in -- retained as a leakage diagnostic and for
+    #    its residual-PSD noise floor / harmonic content.
     lk: LockinResult = lockin_amplitude(
         phi, fs, f0,
         n_harmonics=config.n_harmonics,
@@ -155,29 +199,28 @@ def estimate_opd(
         window=config.window,
     )
 
-    # 3) Independent spectral cross-check.
+    # 4) Independent (windowed) spectral cross-check.  Compared against the
+    #    demodulator, both are leakage-suppressed, so a large disagreement now
+    #    flags a genuine problem rather than leakage.
     amp_spec = single_bin_amplitude(phi, fs, f0, window=config.window)
     agreement = (
-        abs(lk.amplitude - amp_spec) / lk.amplitude if lk.amplitude > 0 else np.nan
+        abs(dm.amplitude - amp_spec) / dm.amplitude if dm.amplitude > 0 else np.nan
     )
+    leakage_ratio = lk.amplitude / dm.amplitude if dm.amplitude > 0 else np.nan
 
-    # 4) Stationarity / empirical uncertainty.
+    # 5) Stationarity / empirical uncertainty (rectangular per-segment; kept as a
+    #    diagnostic -- note it is leakage-prone and inflated for wandering tones).
     seg_amps = segmented_amplitudes(
         phi, fs, f0,
         n_segments=config.n_stability_segments,
         n_harmonics=config.n_harmonics,
         detrend_order=config.detrend_order,
     )
-    seg_opds = phase_cycles_to_opd(seg_amps, config.freq_dev_peak)
+    seg_opds = phase_cycles_to_opd(seg_amps, dnu_pk)
     if seg_opds.size > 1:
         opd_unc_emp = float(np.std(seg_opds, ddof=1) / np.sqrt(seg_opds.size))
     else:
         opd_unc_emp = float("nan")
-
-    # 5) Convert to OPD.
-    dnu_pk = config.freq_dev_peak
-    opd = float(phase_cycles_to_opd(lk.amplitude, dnu_pk))
-    opd_unc = float(phase_cycles_to_opd(lk.amp_unc_coherent, dnu_pk))
 
     harmonic_ratio = (
         float(lk.harmonic_amps[1] / lk.harmonic_amps[0])
@@ -192,32 +235,37 @@ def estimate_opd(
         amp_ch = single_bin_amplitude(phi_ch, fs, f0, window=config.window)
         channel_opds[f"ch{ch}"] = float(phase_cycles_to_opd(amp_ch, dnu_pk))
 
-    tone_snr = (
-        float(lk.amplitude / lk.amp_unc_coherent)
-        if lk.amp_unc_coherent > 0
-        else float("inf")
-    )
+    tone_snr = float(dm.amplitude / dm.amp_unc) if dm.amp_unc > 0 else float("inf")
 
     return OPDResult(
         name=data.name,
         path=data.path,
         opd=opd,
         opd_unc=opd_unc,
+        opd_drift=opd_drift,
         opd_unc_empirical=opd_unc_emp,
         observable=label,
         tone_freq=f0,
         tone_freq_nominal=f_nominal,
+        tone_freq_offset=dm.freq_offset,
         tone_snr=tone_snr,
-        amp_cycles=lk.amplitude,
-        amp_unc_cycles=lk.amp_unc_coherent,
+        amp_cycles=dm.amplitude,
+        amp_unc_cycles=dm.amp_unc,
+        integration_mode=dm.mode,
+        coherence=dm.coherence,
+        demod_bandwidth=dm.bandwidth,
+        amp_cycles_lockin=lk.amplitude,
         amp_cycles_spectral=amp_spec,
         method_agreement=float(agreement),
+        leakage_ratio=float(leakage_ratio),
         delay=float(opd_to_delay(opd)),
         residual_std=lk.residual_std,
         noise_psd=lk.noise_psd,
         harmonic_ratio=harmonic_ratio,
         duration=lk.duration,
         fs=fs,
+        t_bb=dm.t,
+        opd_t=opd_t,
         segment_opds=seg_opds,
         channel_opds=channel_opds,
     )
