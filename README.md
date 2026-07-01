@@ -6,9 +6,9 @@
 A known single-tone modulation of the laser frequency imprints a phase tone on
 the differential interferometer phase whose amplitude is directly proportional
 to the residual OPD. `het_ifo_opd` ingests Moku:Pro Phasemeter files, estimates
-that tone amplitude with an optimal (maximum-likelihood) least-squares lock-in,
-cross-checks it spectrally, and converts it into an OPD with a rigorous,
-statistically-calibrated uncertainty.
+that tone amplitude with a leakage-immune complex-baseband demodulator,
+cross-checks it spectrally, and converts it into an OPD (and an OPD *time
+series*) with a rigorous, statistically-calibrated uncertainty.
 
 ---
 
@@ -60,30 +60,40 @@ For each file the pipeline:
 1. **Uses the known modulation frequency** supplied by the user (per file or via
    a filename map), optionally refining it on a fine periodogram grid to absorb
    drive/digitizer clock offsets.
-2. **Estimates the amplitude with a least-squares lock-in** (primary). It fits
+2. **Estimates the amplitude with a complex-baseband demodulator** (primary).
+   The differential phase is heterodyned to DC (`φ·e^{−2πi f₀ t}`), low-passed
+   to a narrow one-sided bandwidth `B` around the tone, and decimated, giving
+   the **instantaneous tone phasor** `z(t)` with `|z(t)|` the zero-to-peak
+   amplitude. The narrow low-pass makes the estimate **immune to spectral
+   leakage** from the very large low-frequency differential-phase wander (the
+   `ν₀·OPD(t)/c` term, tens of cycles RMS) that otherwise leaks into the tone
+   bin through the `1/f` sidelobes of a rectangular-window fit — a bias that
+   inflated the naive lock-in by up to ~2× and the short-segment estimates by
+   ~10× on the released/torqued acquisitions.
 
-   ```
-   φ(t) = Σ_k [a_k cos + b_k sin](2π k f₀ t)  +  Σ_p c_p t^p
-   ```
+   The headline amplitude is chosen from a **measured coherence**
+   `ρ = |⟨z⟩| / √⟨|z|²⟩` (constant frequency-offset removed):
+   * `ρ ≥ coherence_threshold` → **coherent** integration `|⟨z⟩|` (optimal SNR);
+   * otherwise → **incoherent**, noise-debiased `√(⟨|z|²⟩ − ⟨|z_off|²⟩)`, the
+     correct estimator for a genuinely phase-wandering tone.
 
-   The fundamental amplitude `√(a₁² + b₁²)` is the OPD signal; harmonics and a
-   polynomial trend (slow laser-noise drift) are fitted as nuisances. For a
-   single tone of known frequency this is the maximum-likelihood / minimum-
-   variance estimator.
-3. **Cross-checks spectrally** with an independent LPSD single-bin estimate
-   (`speckit`), where `A = √(2·PS)`. Agreement of the two methods is reported as
-   a quality metric (≲0.1 % on the clean, high-SNR acquisitions).
-   The reported `tone_snr` is the coherent amplitude SNR `A/σ_A`, equal to
-   `amp_cycles / amp_unc_cycles`.
-4. **Quantifies uncertainty two ways:**
-   * *Coherent (analytic):* `σ_A = √(S_n(f₀)/T)`, with the local background
-     noise PSD `S_n` measured **on the lock-in residual** (the tone removed in
-     the time domain, so its spectral leakage cannot inflate the floor). This
-     equals the Cramér–Rao bound `σ·√(2/N)` for white noise. *(Verified
-     calibrated by Monte-Carlo — see `tests/`.)*
-   * *Empirical (per-segment):* the scatter of the estimate across contiguous
-     segments, which additionally captures genuine slow OPD drift / non-
-     stationarity.
+   The instantaneous `OPD(t) = |z(t)|·c/δν_pk` is retained as the deliverable;
+   for acquisitions whose OPD physically evolves (released/torqued) it is
+   summarised as `mean ± drift`.
+3. **Cross-checks** with the rectangular-window least-squares lock-in (now a
+   **leakage diagnostic**, reported as `leakage_ratio = A_lockin / A_demod`) and
+   an independent windowed LPSD single-bin estimate (`speckit`). Since the
+   demodulator and the windowed single-bin are both leakage-suppressed, their
+   `method_agreement` is small (≲1 %) when the tone is well-behaved and flags a
+   real problem otherwise. `tone_snr = A/σ_A = amp_cycles / amp_unc_cycles`.
+4. **Quantifies uncertainty:**
+   * *Coherent noise floor:* `σ_A = √(⟨|z_off|²⟩ / N_eff)` with `N_eff = T·2B`
+     independent looks, measured from an **off-tone** demodulation — equal to
+     the Cramér–Rao bound `√(S_n(f₀)/T)`. *(Verified calibrated by Monte-Carlo —
+     see `tests/`.)*
+   * *Physical drift:* the standard deviation of `OPD(t)` (real non-stationarity,
+     distinct from the measurement noise floor).
+   * *Empirical (per-segment):* retained as a diagnostic (note: leakage-prone).
 5. **Converts to OPD** via `OPD = A · c / δν_pk`.
 
 ## 3. Installation
@@ -105,10 +115,16 @@ from het_ifo_opd import estimate_opd, OPDConfig
 # Known modulation frequency for this file:
 r = estimate_opd("FM1/FM1Day06_AnchoredAirOPD_EDUbase_R1_20260609_135823.zip",
                  mod_freq=100.0)
-print(f"OPD = {r.opd*1e3:.4f} mm  ± {r.opd_unc*1e6:.2f} µm (coherent)")
-print(f"            ± {r.opd_unc_empirical*1e6:.1f} µm (per-segment drift)")
-print(f"tone {r.tone_freq:.3f} Hz, SNR {r.tone_snr:.3g}, "
+print(f"OPD = {r.opd*1e3:.4f} mm  ± {r.opd_unc*1e6:.2f} µm (noise floor)")
+print(f"          drift ± {r.opd_drift*1e6:.1f} µm  [{r.integration_mode}, "
+      f"coherence {r.coherence:.2f}]")
+print(f"tone {r.tone_freq:.3f} Hz (offset {r.tone_freq_offset*1e3:+.2f} mHz), "
+      f"SNR {r.tone_snr:.3g}, leakage×{r.leakage_ratio:.2f}, "
       f"method agreement {r.method_agreement:.1e}")
+
+# The instantaneous OPD time series (baseband) is the deliverable:
+#   r.t_bb  [s],  r.opd_t  [m]
+
 ```
 
 A whole dataset, assigning the frequency per acquisition day:
@@ -137,8 +153,9 @@ python scripts/analyze_fm1.py FM1 results
 ```
 
 writes `results/opd_results.csv`, a per-file 3-panel diagnostic plot (ASD with
-the tone marked · phase-folded synchronous-averaged tone · per-segment OPD
-stability), and a `summary.png` bar chart.
+the tone marked · phase-folded synchronous-averaged tone · instantaneous
+`OPD(t)` with the headline mode-selected OPD, drift band, and the leakage-prone
+per-segment estimates for comparison), and a `summary.png` bar chart.
 
 ## 5. Package layout
 
@@ -147,8 +164,9 @@ het_ifo_opd/
   config.py       OPDConfig: physics + analysis parameters (FM1 defaults)
   physics.py      phase-amplitude  <->  OPD conversions
   io.py           load Moku:Pro Phasemeter files -> differential phase
-  estimators.py   frequency refinement, least-squares lock-in, spectral single-bin,
-                  local noise PSD, per-segment amplitudes
+  estimators.py   frequency refinement, complex-baseband demodulator (primary),
+                  least-squares lock-in, spectral single-bin, local noise PSD,
+                  per-segment amplitudes
   pipeline.py     estimate_opd / estimate_opd_dataset -> OPDResult / DatasetResult
   plotting.py     per-file diagnostics and dataset summary
   cli.py          `python -m het_ifo_opd` command-line interface
@@ -160,6 +178,9 @@ tests/test_validation.py synthetic accuracy & uncertainty-calibration tests
 
 `python tests/test_validation.py` (or `pytest -q`) verifies on synthetic data
 that the estimator recovers an injected OPD to <1 % on realistic low-frequency-
-dominated noise, that the lock-in and spectral methods agree, and that the
-reported coherent uncertainty matches the Monte-Carlo scatter (i.e. it is
-statistically calibrated and near the Cramér–Rao bound).
+dominated noise, that the reported coherent uncertainty matches the Monte-Carlo
+scatter (calibrated, near the Cramér–Rao bound), and specifically that the
+demodulator is **leakage-immune** — under a 16-cycle low-frequency wander the
+rectangular lock-in is biased >2× high while the demodulator recovers the truth
+to a few percent — and that it correctly falls back to **incoherent** integration
+for a genuinely wandering (chirped) tone.
