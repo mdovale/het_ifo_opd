@@ -23,7 +23,9 @@ def plot_diagnostics(
     (1) Welch ASD of the differential phase (linear frequency axis) with the
         modulation tone marked.
     (2) A few cycles of the differential phase with the lock-in fit overlaid.
-    (3) Per-segment OPD stability with the mean and 1-sigma band.
+    (3) Instantaneous OPD(t) from the demodulator, with the headline
+        (mode-selected) OPD and its physical drift band, plus the leakage-prone
+        per-segment estimates for comparison.
 
     Requires the source data; if ``data`` is not supplied it is reloaded from
     ``result.path``.
@@ -86,12 +88,17 @@ def plot_diagnostics(
     folded_err = np.array([detr[idx == k].std() / max(np.sqrt(np.sum(idx == k)), 1)
                            if np.any(idx == k) else np.nan for k in range(n_bins)])
     centers = (np.arange(n_bins) + 0.5) / n_bins
+    # Scale the overlaid fundamental to the leakage-free (headline) amplitude so
+    # panel 2 is consistent with the reported OPD rather than the leaky lock-in.
     a1, b1 = coef[0], coef[1]
+    hyp = np.hypot(a1, b1)
+    if hyp > 0:
+        a1, b1 = a1 / hyp * result.amp_cycles, b1 / hyp * result.amp_cycles
     model = a1 * np.cos(2 * np.pi * centers) + b1 * np.sin(2 * np.pi * centers)
 
     ax.errorbar(centers, folded * 1e3, yerr=folded_err * 1e3, fmt=".", ms=4,
                 alpha=0.7, label="folded data")
-    ax.plot(centers, model * 1e3, "C3", lw=1.5, label="lock-in fundamental")
+    ax.plot(centers, model * 1e3, "C3", lw=1.5, label="tone fundamental")
     ax.set_xlabel(f"Phase of {f0:.3f} Hz tone [cycles]")
     ax.set_ylabel("Phase [mcyc]")
     ax.set_title(f"Folded tone: A = {result.amp_cycles:.3e} cyc "
@@ -99,22 +106,32 @@ def plot_diagnostics(
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
 
-    # (3) stability
+    # (3) instantaneous OPD(t) from the demodulator.
     ax = axes[2]
-    seg = result.segment_opds * 1e3  # mm
-    ax.plot(np.arange(seg.size) + 1, seg, "o-", ms=4)
-    ax.axhline(result.opd * 1e3, color="C3", lw=1.2, label="full-record")
-    band = result.opd_unc * 1e3
-    ax.axhspan((result.opd - result.opd_unc) * 1e3,
-               (result.opd + result.opd_unc) * 1e3, color="C3", alpha=0.15)
-    ax.set_xlabel("Segment")
+    if result.t_bb.size and result.opd_t.size:
+        ax.plot(result.t_bb, result.opd_t * 1e3, lw=0.7, color="C0",
+                alpha=0.8, label="OPD(t)")
+    # leakage-prone per-segment estimates, for comparison (open markers).
+    seg = result.segment_opds * 1e3
+    if seg.size:
+        seg_t = (np.arange(seg.size) + 0.5) * result.duration / seg.size
+        ax.plot(seg_t, seg, "o", ms=4, mfc="none", color="0.5",
+                label="per-segment (leaky)")
+    ax.axhline(result.opd * 1e3, color="C3", lw=1.2,
+               label=f"headline ({result.integration_mode})")
+    ax.axhspan((result.opd - result.opd_drift) * 1e3,
+               (result.opd + result.opd_drift) * 1e3, color="C3", alpha=0.15)
+    ax.set_xlabel("Time [s]")
     ax.set_ylabel("OPD [mm]")
     ax.set_title(
-        f"OPD = {result.opd * 1e3:.4f} ± {result.opd_unc * 1e6:.2f} µm",
-        fontsize=9,
+        f"OPD = {result.opd * 1e3:.4f} mm  "
+        f"(drift ±{result.opd_drift * 1e3:.4f}, noise ±{result.opd_unc * 1e6:.2f} µm)\n"
+        f"coherence {result.coherence:.2f}, leakage×{result.leakage_ratio:.2g}, "
+        f"df {result.tone_freq_offset * 1e3:.2f} mHz",
+        fontsize=8,
     )
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
     fig.tight_layout()
     if savepath:
