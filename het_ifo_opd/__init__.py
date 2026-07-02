@@ -27,7 +27,9 @@ from .physics import (
 from .estimators import (
     DemodResult,
     LockinResult,
+    RobustDemodResult,
     demodulate,
+    demodulate_robust,
     lockin_amplitude,
     local_noise_psd,
     refine_frequency,
@@ -37,8 +39,10 @@ from .estimators import (
 from .pipeline import (
     DatasetResult,
     OPDResult,
+    RobustOPDResult,
     estimate_opd,
     estimate_opd_dataset,
+    estimate_opd_robust,
 )
 
 __version__ = "0.1.0"
@@ -55,14 +59,18 @@ __all__ = [
     "opd_to_carrier_cycles",
     "LockinResult",
     "DemodResult",
+    "RobustDemodResult",
     "lockin_amplitude",
     "demodulate",
+    "demodulate_robust",
     "single_bin_amplitude",
     "refine_frequency",
     "local_noise_psd",
     "segmented_amplitudes",
     "OPDResult",
+    "RobustOPDResult",
     "DatasetResult",
     "estimate_opd",
     "estimate_opd_dataset",
+    "estimate_opd_robust",
 ]

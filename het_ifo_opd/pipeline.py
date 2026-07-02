@@ -20,7 +20,9 @@ from .config import OPDConfig
 from .estimators import (
     DemodResult,
     LockinResult,
+    RobustDemodResult,
     demodulate,
+    demodulate_robust,
     lockin_amplitude,
     refine_frequency,
     segmented_amplitudes,
@@ -268,6 +270,165 @@ def estimate_opd(
         opd_t=opd_t,
         segment_opds=seg_opds,
         channel_opds=channel_opds,
+    )
+
+
+@dataclass
+class RobustOPDResult:
+    """Outcome of the motion-robust OPD estimation for one acquisition.
+
+    Carries both the *standard* pipeline number (``opd_standard``) and the
+    motion-robust number (``opd_robust``), so a single call gives the
+    before/after comparison used to defeat a rattly (impulsively moving) test
+    mass.  All OPDs are in metres; motion arrays are the test-mass displacement
+    read from the low-frequency differential phase.
+    """
+
+    name: str
+    path: str
+    observable: str
+    tone_freq: float
+    tone_freq_nominal: float
+
+    # Standard (whole-record) estimate, for comparison.
+    opd_standard: float          # [m]
+    standard_mode: str
+    coherence: float
+
+    # Robust estimate.
+    opd_robust: float            # [m] headline robust OPD (gated median)
+    opd_robust_unc: float        # [m]
+    robust_mode: str
+    opd_robust_median: float     # [m]
+    opd_robust_coherent: float   # [m] cross-check
+    opd_robust_incoherent: float # [m] cross-check
+    gated_coherence: float
+    kept_fraction: float
+    contamination_ratio: float   # near-tone / off-tone noise floor
+    near_tone_floor: float       # [m] absolute in-band noise floor
+    reliability: float           # opd_robust / near_tone_floor
+    tone_snr_robust: float
+
+    # Test-mass motion (from the low-frequency differential phase).
+    motion_rms: float            # [m] RMS displacement in the motion band
+    motion_band: tuple           # (lo, hi) [Hz]
+
+    # Instantaneous OPD(t) from the standard demodulator (baseband).
+    t_bb: np.ndarray = field(default_factory=lambda: np.array([]))
+    opd_t: np.ndarray = field(default_factory=lambda: np.array([]))
+    motion_t: np.ndarray = field(default_factory=lambda: np.array([]))
+    motion: np.ndarray = field(default_factory=lambda: np.array([]))
+    keep_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    def summary_row(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "OPD_standard_mm": self.opd_standard * 1e3,
+            "OPD_robust_mm": self.opd_robust * 1e3,
+            "OPD_robust_unc_um": self.opd_robust_unc * 1e6,
+            "standard_mode": self.standard_mode,
+            "robust_mode": self.robust_mode,
+            "coherence": self.coherence,
+            "gated_coherence": self.gated_coherence,
+            "kept_fraction": self.kept_fraction,
+            "contamination_ratio": self.contamination_ratio,
+            "near_tone_floor_um": self.near_tone_floor * 1e6,
+            "reliability": self.reliability,
+            "motion_rms_um": self.motion_rms * 1e6,
+            "tone_freq_Hz": self.tone_freq,
+        }
+
+
+def estimate_opd_robust(
+    source: Union[str, PhasemeterData],
+    config: Optional[OPDConfig] = None,
+    logger: Optional[logging.Logger] = None,
+    mod_freq: Optional[float] = None,
+    **robust_kwargs,
+) -> RobustOPDResult:
+    """Motion-robust OPD estimate (see :class:`RobustOPDResult`).
+
+    Runs :func:`het_ifo_opd.estimators.demodulate_robust`, which defends against
+    a rattly test mass injecting broadband power into the demodulation band, and
+    returns both the standard and robust OPDs plus the test-mass motion read from
+    the low-frequency differential phase.  ``robust_kwargs`` are forwarded to the
+    estimator (e.g. ``keep_quantile``, ``adjacent_offsets``).
+    """
+    if config is None:
+        config = OPDConfig()
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    if isinstance(source, PhasemeterData):
+        data = source
+    else:
+        data = load_phasemeter(
+            source, start_time=config.start_time, duration=config.duration,
+            logger=logger,
+        )
+
+    label, phi = data.differential(config.channels)
+    fs = data.fs
+    f_nominal = _resolve_mod_freq(mod_freq, config)
+    if config.refine_frequency:
+        f0 = refine_frequency(phi, fs, f_nominal,
+                              halfwidth=config.freq_search_halfwidth)
+    else:
+        f0 = f_nominal
+
+    dnu_pk = config.freq_dev_peak
+    lam = config.laser_wavelength
+
+    rdm: RobustDemodResult = demodulate_robust(
+        phi, fs, f0,
+        bandwidth=config.demod_bandwidth,
+        fs_bb_target=config.demod_fs_bb,
+        off_tone=config.demod_off_tone,
+        coherence_threshold=config.coherence_threshold,
+        **robust_kwargs,
+    )
+
+    opd_standard = float(phase_cycles_to_opd(rdm.amp_standard, dnu_pk))
+    opd_robust = float(phase_cycles_to_opd(rdm.amp_robust, dnu_pk))
+    opd_robust_unc = float(phase_cycles_to_opd(rdm.amp_unc_robust, dnu_pk))
+    opd_rm = float(phase_cycles_to_opd(rdm.amp_robust_median, dnu_pk))
+    opd_rc = float(phase_cycles_to_opd(rdm.amp_robust_coherent, dnu_pk))
+    opd_ri = float(phase_cycles_to_opd(rdm.amp_robust_incoherent, dnu_pk))
+    opd_t = phase_cycles_to_opd(np.abs(rdm.z), dnu_pk)
+    # Motion: 1 cycle of differential phase == one carrier wavelength of OPD.
+    motion = rdm.motion_cyc * lam
+    motion_rms = float(rdm.motion_rms_cyc * lam)
+    snr = (rdm.amp_robust / rdm.amp_unc_robust
+           if rdm.amp_unc_robust > 0 else float("inf"))
+
+    return RobustOPDResult(
+        name=data.name,
+        path=data.path,
+        observable=label,
+        tone_freq=f0,
+        tone_freq_nominal=f_nominal,
+        opd_standard=opd_standard,
+        standard_mode=rdm.standard_mode,
+        coherence=rdm.coherence,
+        opd_robust=opd_robust,
+        opd_robust_unc=opd_robust_unc,
+        robust_mode=rdm.robust_mode,
+        opd_robust_median=opd_rm,
+        opd_robust_coherent=opd_rc,
+        opd_robust_incoherent=opd_ri,
+        gated_coherence=rdm.gated_coherence,
+        kept_fraction=rdm.kept_fraction,
+        contamination_ratio=rdm.contamination_ratio,
+        near_tone_floor=float(phase_cycles_to_opd(rdm.near_tone_floor, dnu_pk)),
+        reliability=rdm.reliability,
+        tone_snr_robust=float(snr),
+        motion_rms=motion_rms,
+        motion_band=rdm.motion_band,
+        t_bb=rdm.t,
+        opd_t=opd_t,
+        motion_t=rdm.motion_t,
+        motion=motion,
+        keep_mask=rdm.keep_mask,
     )
 
 
