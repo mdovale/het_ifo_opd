@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from scipy.signal import fftconvolve, firwin
+from scipy.signal import butter, fftconvolve, filtfilt, firwin
 
 from speckit import compute_single_bin, compute_spectrum
 
@@ -387,4 +387,236 @@ def demodulate(
         mode=mode,
         amplitude=float(amplitude),
         numtaps=int(numtaps),
+    )
+
+
+@dataclass
+class RobustDemodResult:
+    """Motion-robust demodulation of the tone at ``f0``.
+
+    Extends :class:`DemodResult` with three defences against a *rattly* test
+    mass, i.e. a released harmonic oscillator whose large, impulsive motion
+    deposits broadband power inside the narrow demodulation band around ``f0``.
+
+    The contamination enters because the differential phase is
+    ``phi = nu(t) * OPD(t) / c``: any OPD-motion spectral content at ``f0`` is
+    amplified by ``nu0 / delta_nu_pk ~ 1e6`` relative to the wanted tone, so it
+    cannot be removed by narrowing the band (it is *in* band).  The remedies are
+
+    1. an **adjacent-bin** estimate of the true local noise floor (the single
+       far off-tone reference under-estimates the coloured near-tone floor);
+    2. **burst gating**: an in-band noise witness (an adjacent-band magnitude vs
+       time) selects the quiet epochs, over which the tone is integrated;
+    3. a **robust (median) magnitude** of the tone phasor over the gated epochs.
+       Contamination bursts only ever *raise* the instantaneous magnitude
+       ``|z(t)|`` above the static-OPD baseline, so the median (immune to a
+       minority of inflated samples) recovers the true static OPD, whereas the
+       mean-square (incoherent) estimator sums the excess power as if it were
+       signal and biases high.  The coherent and adjacent-debiased incoherent
+       amplitudes are also returned for cross-checking.
+
+    It also returns the test-mass **motion** read directly from the
+    low-frequency differential phase (``1`` cycle ``=`` one carrier wavelength of
+    OPD), which is the high-resolution, unbiased force-sensing signal.
+    """
+
+    f0: float
+    bandwidth: float
+    fs_bb: float
+    t: np.ndarray
+    z: np.ndarray
+
+    # Standard whole-record estimates (from :func:`demodulate`), for comparison.
+    amp_standard: float          # mode-selected headline [cyc]
+    amp_coherent: float          # whole-record coherent [cyc]
+    amp_incoherent: float        # whole-record incoherent (off-tone debiased) [cyc]
+    coherence: float
+    standard_mode: str
+    noise_ms_offtone: float      # far off-tone mean-square [cyc^2]
+
+    # Robust estimate.
+    amp_robust: float            # headline robust amplitude (gated median) [cyc]
+    amp_unc_robust: float        # 1-sigma on the robust amplitude [cyc]
+    robust_mode: str             # estimator label ("gated-median")
+    amp_robust_median: float     # gated median |z| [cyc] (headline)
+    amp_robust_coherent: float   # gated, debiased coherent [cyc] (cross-check)
+    amp_robust_incoherent: float # gated, adjacent-debiased incoherent [cyc]
+    gated_coherence: float
+    kept_fraction: float
+    keep_quantile: float
+    keep_mask: np.ndarray
+    witness: np.ndarray          # in-band noise witness vs baseband time
+    noise_ms_adjacent: float     # near-tone mean-square [cyc^2]
+    near_tone_floor: float       # sqrt(noise_ms_adjacent) [cyc], absolute in-band floor
+    contamination_ratio: float   # adjacent / off-tone floor (>1 => in-band injection)
+    reliability: float           # amp_robust / near_tone_floor (>~3 => trustworthy)
+    freq_offset: float
+
+    # Test-mass motion from the low-frequency differential phase.
+    motion_t: np.ndarray         # full-rate time [s]
+    motion_cyc: np.ndarray       # band-limited differential phase [cyc]
+    motion_rms_cyc: float        # RMS motion [cyc] (x wavelength -> metres)
+    motion_band: tuple           # (lo, hi) [Hz]
+
+
+def demodulate_robust(
+    phi: np.ndarray,
+    fs: float,
+    f0: float,
+    bandwidth: float = 0.5,
+    fs_bb_target: Optional[float] = None,
+    off_tone: float = 7.0,
+    coherence_threshold: float = 0.7,
+    adjacent_offsets: tuple = (1.2, 1.6, 2.0),
+    witness_offset: float = 1.5,
+    keep_quantile: float = 0.5,
+    witness_smooth_s: float = 2.0,
+    min_keep_fraction: float = 0.1,
+    motion_band: Optional[tuple] = None,
+) -> RobustDemodResult:
+    """Motion-robust demodulation (see :class:`RobustDemodResult`).
+
+    Parameters mirror :func:`demodulate`, plus:
+
+    adjacent_offsets : tuple of float
+        Offsets [Hz] on both sides of ``f0`` at which the local noise floor is
+        measured (must exceed ``2*bandwidth`` so the passband clears the tone).
+    witness_offset : float
+        Offset [Hz] of the adjacent band whose magnitude is the in-band noise
+        witness used for gating.
+    keep_quantile : float
+        Fraction of the record (lowest-witness epochs) kept for integration.
+    witness_smooth_s : float
+        Smoothing time [s] applied to the witness before thresholding.
+    min_keep_fraction : float
+        Never keep fewer than this fraction of samples.
+    motion_band : tuple, optional
+        Band [Hz] of the low-frequency differential phase reported as the
+        test-mass motion.  Defaults to ``(0.5, min(f0 - 5, 45))``.
+    """
+    phi = np.asarray(phi, dtype=float)
+    n = phi.size
+    if fs_bb_target is None:
+        fs_bb_target = 8.0 * bandwidth
+    nyq = fs / 2.0
+
+    # Standard demodulation for the reference numbers and the phasor z(t).
+    dm = demodulate(
+        phi, fs, f0, bandwidth=bandwidth, fs_bb_target=fs_bb_target,
+        off_tone=off_tone, coherence_threshold=coherence_threshold,
+    )
+    z = dm.z
+    t = dm.t
+    fs_bb = dm.fs_bb
+
+    # 1) Adjacent-bin noise floor (the true local floor next to the tone).
+    ms_list = []
+    for off in adjacent_offsets:
+        for s in (+1.0, -1.0):
+            f_adj = f0 + s * off
+            if f_adj <= 0 or f_adj > 0.9 * nyq:
+                continue
+            _, z_adj, _, _ = _heterodyne_lowpass(phi, fs, f_adj, bandwidth,
+                                                 fs_bb_target)
+            ms_list.append(float(np.mean(np.abs(z_adj) ** 2)))
+    noise_ms_adjacent = float(np.median(ms_list)) if ms_list else dm.noise_ms
+    contamination_ratio = (noise_ms_adjacent / dm.noise_ms
+                           if dm.noise_ms > 0 else float("nan"))
+
+    # 2) In-band noise witness vs time (adjacent-band magnitude), then gate.
+    f_wit = f0 + witness_offset
+    if f_wit > 0.9 * nyq:
+        f_wit = f0 - witness_offset
+    _, z_wit, _, _ = _heterodyne_lowpass(phi, fs, f_wit, bandwidth, fs_bb_target)
+    m = min(z.size, z_wit.size)
+    z = z[:m]
+    t = t[:m]
+    witness = np.abs(z_wit[:m])
+    w_len = max(1, int(round(witness_smooth_s * fs_bb)))
+    if w_len > 1:
+        kern = np.ones(w_len) / w_len
+        witness_s = np.convolve(witness, kern, mode="same")
+    else:
+        witness_s = witness
+
+    thr = np.quantile(witness_s, keep_quantile)
+    keep = witness_s <= thr
+    if keep.mean() < min_keep_fraction:
+        thr = np.quantile(witness_s, min_keep_fraction)
+        keep = witness_s <= thr
+    kept_fraction = float(keep.mean())
+
+    # 3a) Headline robust amplitude: the coherent projection |mean(z)| over the
+    #     quiet epochs, at the refined, clock-locked tone frequency and with NO
+    #     data-driven de-rotation.  This is the matched filter (ML estimator) for
+    #     a constant, clock-locked tone: any zero-mean in-band contamination
+    #     (broadband motion power that lands at f0 with random phase) averages to
+    #     zero in the vector mean, so the estimate is unbiased however large that
+    #     contamination is, whereas the mean-square (incoherent) estimator sums
+    #     the excess power as if it were signal.  The linear-phase-ramp fit used
+    #     by :func:`demodulate` is deliberately avoided here because a contaminated
+    #     phase corrupts the fit and smears the true tone.
+    dur_kept = kept_fraction * (t[-1] - t[0]) if t.size > 1 else 0.0
+    n_indep = max(dur_kept * 2.0 * bandwidth, 1.0)
+    amp_unc_robust = float(np.sqrt(noise_ms_adjacent / n_indep))
+    freq_offset = float(dm.freq_offset)
+
+    mean_kept = np.mean(z[keep]) if keep.any() else 0.0 + 0.0j
+    amp_robust_coherent = float(np.abs(mean_kept))
+
+    # 3b) Cross-checks: gated median |z| (robust to a burst minority) and gated
+    #     adjacent-debiased incoherent amplitude (uses the true near-tone floor).
+    zk = np.abs(z[keep]) if keep.any() else np.abs(z)
+    amp_robust_median = float(np.median(zk)) if zk.size else 0.0
+    ms_kept = float(np.mean(np.abs(z[keep]) ** 2)) if keep.any() else 0.0
+    amp_robust_incoherent = float(np.sqrt(max(ms_kept - noise_ms_adjacent, 0.0)))
+
+    gated_coherence = (amp_robust_coherent / amp_robust_incoherent
+                       if amp_robust_incoherent > 0 else 0.0)
+    robust_mode = "coherent-projection"
+    amp_robust = amp_robust_coherent
+
+    # Test-mass motion from the low-frequency differential phase.
+    if motion_band is None:
+        motion_band = (0.5, float(min(f0 - 5.0, 45.0)))
+    lo, hi = motion_band
+    x = phi - np.mean(phi)
+    bcoef, acoef = butter(4, [lo / nyq, hi / nyq], btype="band")
+    motion_cyc = filtfilt(bcoef, acoef, x)
+    motion_rms_cyc = float(np.std(motion_cyc))
+    motion_t = np.arange(n) / fs
+
+    return RobustDemodResult(
+        f0=float(f0),
+        bandwidth=float(bandwidth),
+        fs_bb=float(fs_bb),
+        t=t,
+        z=z,
+        amp_standard=dm.amplitude,
+        amp_coherent=dm.amp_coherent,
+        amp_incoherent=dm.amp_incoherent,
+        coherence=dm.coherence,
+        standard_mode=dm.mode,
+        noise_ms_offtone=dm.noise_ms,
+        amp_robust=amp_robust,
+        amp_unc_robust=amp_unc_robust,
+        robust_mode=robust_mode,
+        amp_robust_median=amp_robust_median,
+        amp_robust_coherent=amp_robust_coherent,
+        amp_robust_incoherent=amp_robust_incoherent,
+        gated_coherence=float(gated_coherence),
+        kept_fraction=kept_fraction,
+        keep_quantile=float(keep_quantile),
+        keep_mask=keep,
+        witness=witness_s,
+        noise_ms_adjacent=noise_ms_adjacent,
+        near_tone_floor=float(np.sqrt(noise_ms_adjacent)),
+        contamination_ratio=float(contamination_ratio),
+        reliability=float(amp_robust / np.sqrt(noise_ms_adjacent))
+        if noise_ms_adjacent > 0 else float("inf"),
+        freq_offset=freq_offset,
+        motion_t=motion_t,
+        motion_cyc=motion_cyc,
+        motion_rms_cyc=motion_rms_cyc,
+        motion_band=tuple(motion_band),
     )
